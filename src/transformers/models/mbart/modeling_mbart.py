@@ -168,6 +168,7 @@ class MBartAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        past_prompt=None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -175,6 +176,7 @@ class MBartAttention(nn.Module):
         # for the decoder
         is_cross_attention = key_value_states is not None
         bsz, tgt_len, embed_dim = hidden_states.size()
+        prompt = past_prompt
 
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
@@ -187,6 +189,10 @@ class MBartAttention(nn.Module):
             # cross_attentions
             key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
             value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
+
+            if prompt:
+                key_states = torch.cat([prompt['prev_key'], key_states], dim=2)
+                value_states = torch.cat([prompt['prev_value'], value_states], dim=2)
         elif past_key_value is not None:
             # reuse k, v, self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
@@ -197,6 +203,10 @@ class MBartAttention(nn.Module):
             # self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+
+            if prompt:
+                key_states = torch.cat([prompt['prev_key'], key_states], dim=2)
+                value_states = torch.cat([prompt['prev_value'], value_states], dim=2)
 
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
@@ -290,6 +300,7 @@ class MBartEncoderLayer(nn.Module):
         attention_mask: torch.Tensor,
         layer_head_mask: torch.Tensor,
         output_attentions: bool = False,
+        past_prompt=None
     ):
         """
         Args:
@@ -302,13 +313,15 @@ class MBartEncoderLayer(nn.Module):
                 Whether or not to return the attentions tensors of all attention layers. See ``attentions`` under
                 returned tensors for more detail.
         """
-        residual = hidden_states
+        prompt = past_prompt  # bsz, head_num(12), prompt_seq_len, head_dim(64)
+        residual = hidden_states  # bsz, seq_len, 768
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states, attn_weights, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
+            past_prompt=prompt['encoder_prompt'] if prompt else None
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
@@ -373,6 +386,7 @@ class MBartDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = True,
+        past_prompt=None
     ):
         """
         Args:
@@ -392,6 +406,8 @@ class MBartDecoderLayer(nn.Module):
                 returned tensors for more detail.
         """
         residual = hidden_states
+
+        prompt = past_prompt
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
         # Self Attention
@@ -404,6 +420,7 @@ class MBartDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
+            past_prompt=prompt['decoder_prompt'] if prompt else None
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
@@ -424,6 +441,7 @@ class MBartDecoderLayer(nn.Module):
                 layer_head_mask=cross_attn_layer_head_mask,
                 past_key_value=cross_attn_past_key_value,
                 output_attentions=output_attentions,
+                past_prompt=prompt['cross_attention_prompt'] if prompt else None
             )
             hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
             hidden_states = residual + hidden_states
@@ -695,6 +713,7 @@ class MBartEncoder(MBartPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        past_prompt=None
     ):
         r"""
         Args:
@@ -764,6 +783,16 @@ class MBartEncoder(MBartPreTrainedModel):
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             attention_mask = _expand_mask(attention_mask, inputs_embeds.dtype)
 
+        # We add the prompt here.
+        prompt = past_prompt
+
+        if prompt is not None and attention_mask is not None:
+            bsz_input, _, tgt_seq_len, src_seq_len = attention_mask.size()
+            bsz_prefix, _, prefix_seq_length, _ = prompt[0]['encoder_prompt']['prev_key'].size()
+            bsz = bsz_input if bsz_input == bsz_prefix else AssertionError("In Encoder, the bsz of input and prefix must be the same")
+            attention_mask = torch.cat(
+            [torch.zeros(bsz, 1, tgt_seq_len, prefix_seq_length).to(attention_mask.device), attention_mask], dim=3)
+
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
@@ -800,6 +829,7 @@ class MBartEncoder(MBartPreTrainedModel):
                         attention_mask,
                         layer_head_mask=(head_mask[idx] if head_mask is not None else None),
                         output_attentions=output_attentions,
+                        past_prompt=prompt[idx] if prompt else None
                     )
 
                 hidden_states = layer_outputs[0]
@@ -890,6 +920,7 @@ class MBartDecoder(MBartPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        past_prompt=None
     ):
         r"""
         Args:
@@ -992,6 +1023,32 @@ class MBartDecoder(MBartPreTrainedModel):
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             encoder_attention_mask = _expand_mask(encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
 
+
+        prompt = past_prompt
+        if prompt is not None and attention_mask is not None:
+            # Add prefix attention to the attention mask
+            bsz_input, _, tgt_seq_len, src_seq_len = attention_mask.size()
+            bsz_prefix, _, prefix_seq_length, _ = prompt[0]['decoder_prompt']['prev_key'].size()
+            # Here we just want to get the prefix seq length so encoder/decoder/cross_attention or
+            # key/value actually doesn't matter
+            bsz = bsz_input if bsz_input == bsz_prefix else None
+
+            attention_mask = torch.cat([torch.zeros(bsz, 1, tgt_seq_len, prefix_seq_length).to(attention_mask.device), attention_mask],
+            dim=3)
+
+        if prompt is not None and encoder_attention_mask is not None:
+            # Add prefix attention to the cross attention mask
+            bsz_input, _, tgt_seq_len, src_seq_len = encoder_attention_mask.size()
+            bsz_prefix, _, prefix_seq_length, _ = prompt[0]['cross_attention_prompt']['prev_key'].size()
+            bsz = bsz_input if bsz_input == bsz_prefix else None
+            # if bsz is None:
+            #     prompt = None
+            # else:
+            encoder_attention_mask = torch.cat(
+            [torch.zeros(bsz, 1, tgt_seq_len, prefix_seq_length).to(encoder_attention_mask.device), encoder_attention_mask],
+            dim=3)
+
+
         # embed positions
         positions = self.embed_positions(input_shape, past_key_values_length)
 
@@ -1062,6 +1119,7 @@ class MBartDecoder(MBartPreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    past_prompt=prompt[idx] if prompt else None
                 )
             hidden_states = layer_outputs[0]
 
@@ -1150,6 +1208,7 @@ class MBartModel(MBartPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        past_prompt=None
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1163,6 +1222,9 @@ class MBartModel(MBartPreTrainedModel):
         if decoder_input_ids is None and decoder_inputs_embeds is None:
             decoder_input_ids = shift_tokens_right(input_ids, self.config.pad_token_id)
 
+        # We receive the prefix-tuning prompt module and pass them to the encoder and decoder of BART.
+        prompt = past_prompt
+
         if encoder_outputs is None:
             encoder_outputs = self.encoder(
                 input_ids=input_ids,
@@ -1172,6 +1234,7 @@ class MBartModel(MBartPreTrainedModel):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                past_prompt=prompt
             )
         # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
         elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
@@ -1195,6 +1258,7 @@ class MBartModel(MBartPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            past_prompt=prompt
         )
 
         if not return_dict:
@@ -1279,6 +1343,7 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        past_prompt=None
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
@@ -1287,7 +1352,6 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
             (masked), the loss is only computed for the tokens with labels in ``[0, ..., config.vocab_size]``.
 
         Returns:
-
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1311,6 +1375,7 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            past_prompt=past_prompt
         )
         lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
 
@@ -1361,6 +1426,7 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
             "decoder_head_mask": decoder_head_mask,
             "cross_attn_head_mask": cross_attn_head_mask,
             "use_cache": use_cache,  # change this to avoid caching (presumably for debugging)
+            "past_prompt": kwargs['past_prompt'] if 'past_prompt' in kwargs else None
         }
 
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
